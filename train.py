@@ -64,22 +64,71 @@ def de_interleave(x, size):
     s = list(x.shape)
     return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
 
+def compute_svd_per_sample(dataset, batch_size, svd_dim, device, labeled=True):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    if labeled:
+        imgs, _ , _= next(iter(loader))   # imgs: [N, C, H, W]
+    else:
+        (imgs,_), _, _ = next(iter(loader))
+    N, C, H, W = imgs.shape
+    
+    left_singular_matrices = []
+
+    for i in range(N):
+        img = imgs[i].squeeze(0)  # 变成 (H, W)
+        U, S, V = torch.pca_lowrank(img, q=svd_dim, center=True)
+        left_singular_matrices.append(U)
+
+    left_singular_matrices = torch.stack(left_singular_matrices, dim=0).to(device)
+    
+    return left_singular_matrices
+
+# 计算余弦相似度的辅助函数
+def cosine_similarity_matrix(unlabeled, labeled):
+    unlabeled = unlabeled.view(-1, unlabeled.size(-1))  # 变为 (112*28, 20)
+    labeled = labeled.view(-1, labeled.size(-1))        # 变为 (16*28, 20)
+
+    sim_matrix = F.cosine_similarity(unlabeled.unsqueeze(1), labeled.unsqueeze(0), dim=-1)
+    sim_matrix = (sim_matrix + 1) / 2  # 映射到 [0, 1] 范围
+
+    return sim_matrix
+
+# 计算 (112, 16) 的相似度矩阵
+def calculate_similarity(F_norm_unlabeled, F_norm_labeled, threshold):
+    num_unlabeled = F_norm_unlabeled.size(0)  # 112
+    num_labeled = F_norm_labeled.size(0)      # 16
+
+    similarity_matrix = cosine_similarity_matrix(F_norm_unlabeled, F_norm_labeled)
+
+    # 对相似度矩阵进行排序并选择最大值
+    # similarity_matrix 是 (112*28, 16*28)，需要重塑为合适的形状
+    similarity_matrix = similarity_matrix.view(num_unlabeled, 28, num_labeled, 28)  # (112, 28, 16, 28)
+    
+    # 对每行的 28 个值（每列之间）进行排序，并取最大值
+    sorted_similarities, _ = torch.sort(similarity_matrix, dim=-1, descending=True)
+    
+    # 取每对样本的最大余弦相似度值
+    max_similarities = sorted_similarities[:, :, :, 0].sum(dim=1)  # 对 28 列求和
+
+    filtered_unlabeled = (max_similarities.max(dim=1)[0] > threshold)  # 判断是否有一个值大于阈值
+    return filtered_unlabeled
+
 
 def main():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
     parser.add_argument('--gpu-id', default='0', type=int,
                         help='id(s) for CUDA_VISIBLE_DEVICES')
-    parser.add_argument('--num-workers', type=int, default=4,
+    parser.add_argument('--num-workers', type=int, default=0,
                         help='number of workers')
-    parser.add_argument('--dataset', default='cifar10', type=str,
-                        choices=['cifar10', 'cifar100'],
+    parser.add_argument('--dataset', default='mnist', type=str,
+                        choices=['cifar10', 'cifar100', 'mnist'],
                         help='dataset name')
-    parser.add_argument('--num-labeled', type=int, default=4000,
+    parser.add_argument('--num-labeled', type=int, default=400,
                         help='number of labeled data')
     parser.add_argument("--expand-labels", action="store_true",
                         help="expand labels to fit eval steps")
-    parser.add_argument('--arch', default='wideresnet', type=str,
-                        choices=['wideresnet', 'resnext'],
+    parser.add_argument('--arch', default='mnistnet', type=str,
+                        choices=['wideresnet', 'resnext', 'mnistnet'],
                         help='dataset name')
     parser.add_argument('--total-steps', default=2**20, type=int,
                         help='number of total steps to run')
@@ -87,7 +136,7 @@ def main():
                         help='number of eval steps to run')
     parser.add_argument('--start-epoch', default=0, type=int,
                         help='manual epoch number (useful on restarts)')
-    parser.add_argument('--batch-size', default=64, type=int,
+    parser.add_argument('--batch-size', default=16, type=int,
                         help='train batchsize')
     parser.add_argument('--lr', '--learning-rate', default=0.03, type=float,
                         help='initial learning rate')
@@ -124,7 +173,10 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--no-progress', action='store_true',
                         help="don't use progress bar")
-
+    parser.add_argument('--svd_dim', type=int, default=20,
+                    help='SVD dim')
+    parser.add_argument('--sim_threshold', type=float, default=30,
+                    help='SVD threshold')
     args = parser.parse_args()
     global best_acc
 
@@ -141,22 +193,27 @@ def main():
                                          depth=args.model_depth,
                                          width=args.model_width,
                                          num_classes=args.num_classes)
+        elif args.arch == 'mnistnet':
+            from models.mnistnet import build_mnist_model
+            model = build_mnist_model(num_classes=args.num_classes)
+
         logger.info("Total params: {:.2f}M".format(
             sum(p.numel() for p in model.parameters())/1e6))
         return model
 
-    if args.local_rank == -1:
-        device = torch.device('cuda', args.gpu_id)
-        args.world_size = 1
-        args.n_gpu = torch.cuda.device_count()
-    else:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device('cuda', args.local_rank)
-        torch.distributed.init_process_group(backend='nccl')
-        args.world_size = torch.distributed.get_world_size()
-        args.n_gpu = 1
-
-    args.device = device
+    # if args.local_rank == -1:
+    #     device = torch.device('cuda', args.gpu_id)
+    #     args.world_size = 1
+    #     args.n_gpu = torch.cuda.device_count()
+    # else:
+    #     torch.cuda.set_device(args.local_rank)
+    #     device = torch.device('cuda', args.local_rank)
+    #     torch.distributed.init_process_group(backend='nccl')
+    #     args.world_size = torch.distributed.get_world_size()
+    #     args.n_gpu = 1
+    args.n_gpu = 1
+    args.world_size = 1
+    args.device = torch.device("mps")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -166,7 +223,6 @@ def main():
     logger.warning(
         f"Process rank: {args.local_rank}, "
         f"device: {args.device}, "
-        f"n_gpu: {args.n_gpu}, "
         f"distributed training: {bool(args.local_rank != -1)}, "
         f"16-bits training: {args.amp}",)
 
@@ -198,12 +254,21 @@ def main():
             args.model_cardinality = 8
             args.model_depth = 29
             args.model_width = 64
+    elif args.dataset == 'mnist':
+        args.num_classes = 10
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
     labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](
         args, './data')
+    left_singular_matrices_labeled = compute_svd_per_sample(labeled_dataset,args.batch_size, args.svd_dim, args.device,True)  # [L, H, svd_dim]
+    left_singular_matrices_unlabeled = compute_svd_per_sample(unlabeled_dataset, len(unlabeled_dataset),args.svd_dim, args.device,False)  # [U, H, svd_dim]
+    # print(left_singular_matrices_labeled.shape,left_singular_matrices_unlabeled.shape)
+
+    # 将 SVD 特征保存到 args 或者全局变量中
+    args.left_singular_matrices_labeled = left_singular_matrices_labeled
+    args.left_singular_matrices_unlabeled = left_singular_matrices_unlabeled
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -322,35 +387,40 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         losses_x = AverageMeter()
         losses_u = AverageMeter()
         mask_probs = AverageMeter()
+        pseudo_acc = AverageMeter()
         if not args.no_progress:
             p_bar = tqdm(range(args.eval_step),
                          disable=args.local_rank not in [-1, 0])
         for batch_idx in range(args.eval_step):
             try:
-                inputs_x, targets_x = labeled_iter.next()
-                # error occurs ↓
-                # inputs_x, targets_x = next(labeled_iter)
+                inputs_x, targets_x, _ = next(labeled_iter)
             except:
                 if args.world_size > 1:
                     labeled_epoch += 1
                     labeled_trainloader.sampler.set_epoch(labeled_epoch)
                 labeled_iter = iter(labeled_trainloader)
-                inputs_x, targets_x = labeled_iter.next()
-                # error occurs ↓
-                # inputs_x, targets_x = next(labeled_iter)
-
+                inputs_x, targets_x, _ = next(labeled_iter)
             try:
-                (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
-                # error occurs ↓
-                # (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
+                (inputs_u_w, inputs_u_s), reals_u, idx_u = next(unlabeled_iter)
             except:
                 if args.world_size > 1:
                     unlabeled_epoch += 1
                     unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
                 unlabeled_iter = iter(unlabeled_trainloader)
-                (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
-                # error occurs ↓
-                # (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
+                (inputs_u_w, inputs_u_s), reals_u, idx_u = next(unlabeled_iter)
+
+            # 获取 unlabeled 数据的 SVD 特征
+            F_batch_unlabeled = args.left_singular_matrices_unlabeled[idx_u]  # [B, H, svd_dim]
+
+            # 对 unlabeled batch 特征进行 L2 标准化
+            F_norm_unlabeled = F.normalize(F_batch_unlabeled, p=2, dim=2)  # [B, H, svd_dim]
+
+            # 计算 unlabeled 数据与 labeled 数据的余弦相似度
+            F_batch_labeled = args.left_singular_matrices_labeled  # [L, H, svd_dim]
+            F_norm_labeled = F.normalize(F_batch_labeled, p=2, dim=2)  # [L, H, svd_dim]
+            # print(F_norm_unlabeled.shape,F_norm_labeled.shape)
+            filtered_unlabeled = calculate_similarity(F_norm_unlabeled, F_norm_labeled, threshold=args.sim_threshold)
+            # print(filtered_unlabeled.shape)
 
             data_time.update(time.time() - end)
             batch_size = inputs_x.shape[0]
@@ -367,7 +437,14 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
 
             pseudo_label = torch.softmax(logits_u_w.detach()/args.T, dim=-1)
             max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+            targets_u = targets_u.to(args.device)
+            reals_u = reals_u.to(args.device)
+            correct = torch.sum(targets_u == reals_u).item()  # 计算预测正确的样本数
+            pseudo_acc.update(correct / targets_u.size(0))
             mask = max_probs.ge(args.threshold).float()
+            # print(max_probs.shape,mask.shape)
+            mask = mask * (1 - filtered_unlabeled.float())  # 如果 filtered_unlabeled[i] == True，则 mask[i] = 0
+
 
             Lu = (F.cross_entropy(logits_u_s, targets_u,
                                   reduction='none') * mask).mean()
@@ -393,7 +470,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             end = time.time()
             mask_probs.update(mask.mean().item())
             if not args.no_progress:
-                p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
+                p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Pseudo_acc: {pseudo_acc:.3f}%. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
                     epoch=epoch + 1,
                     epochs=args.epochs,
                     batch=batch_idx + 1,
@@ -401,6 +478,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                     lr=scheduler.get_last_lr()[0],
                     data=data_time.avg,
                     bt=batch_time.avg,
+                    pseudo_acc=pseudo_acc.avg,
                     loss=losses.avg,
                     loss_x=losses_x.avg,
                     loss_u=losses_u.avg,

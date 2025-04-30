@@ -53,8 +53,12 @@ def CutoutAbs(img, v, **kwarg):
     x1 = int(min(w, x0 + v))
     y1 = int(min(h, y0 + v))
     xy = (x0, y0, x1, y1)
-    # gray
-    color = (127, 127, 127)
+    if img.mode == 'L':
+        # 灰度图：单通道，用 0-255 的整数
+        color = 127
+    else:
+        # RGB 图：三通道元组
+        color = (127, 127, 127)
     img = img.copy()
     PIL.ImageDraw.Draw(img).rectangle(xy, color)
     return img
